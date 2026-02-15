@@ -470,3 +470,80 @@ def test_dataform_repository_resource_load_dataform_asset_checks(mock_dataform_c
     assert isinstance(asset_checks[0], AssetChecksDefinition)
     assert asset_checks[0].check_specs_by_output_name["spec"].name == "assertion_1"
     assert asset_checks[0].keys_by_input_name["asset_key"].path[0] == "test_asset"
+
+
+@pytest.mark.parametrize(
+    "mock_dataform_client",
+    [
+        {
+            "git_commitish": "dev",
+            "default_database": "test-database",
+            "default_schema": "test-schema",
+            "default_location": "us-central1",
+            "assertion_schema": "test-assertion-schema",
+        }
+    ],
+    indirect=True,
+)
+def test_dataform_repository_resource_lazy_load_with_metadata(mock_dataform_client):
+    """Test that assets are loaded lazily and have correct metadata when skip_compilation is True."""
+    resource = DataformRepositoryResource(
+        project_id="test-project",
+        repository_id="test-repo",
+        location="us-central1",
+        environment="dev",
+        client=mock_dataform_client,
+        skip_compilation=True,
+    )
+
+    # Assets should not be loaded initially
+    assert resource._assets is None
+
+    # Access assets to trigger lazy load
+    assets = resource.assets
+
+    # Verify lazy load occurred
+    assert resource._assets is not None
+    assert len(assets) == 2
+
+    # Verify metadata contains compilation result name
+    assert (
+        assets[0].metadata["dataform_compilation_result"] == "test-compilation-result"
+    )
+
+
+@pytest.mark.parametrize(
+    "mock_dataform_client",
+    [
+        {
+            "git_commitish": "dev",
+            "default_database": "test-database",
+            "default_schema": "test-schema",
+            "default_location": "us-central1",
+            "assertion_schema": "test-assertion-schema",
+        }
+    ],
+    indirect=True,
+)
+def test_dataform_repository_resource_lazy_load_asset_checks(mock_dataform_client):
+    """Test that asset checks are loaded lazily when skip_compilation is True."""
+    resource = DataformRepositoryResource(
+        project_id="test-project",
+        repository_id="test-repo",
+        location="us-central1",
+        environment="dev",
+        client=mock_dataform_client,
+        skip_compilation=True,
+    )
+
+    # Asset checks should not be loaded initially
+    assert resource._asset_checks is None
+
+    # Access asset checks to trigger lazy load
+    asset_checks = resource.asset_checks
+
+    # Verify lazy load occurred
+    assert resource._asset_checks is not None
+    assert len(asset_checks) == 1
+    assert isinstance(asset_checks[0], AssetChecksDefinition)
+    assert asset_checks[0].check_specs_by_output_name["spec"].name == "assertion_1"

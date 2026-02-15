@@ -11,6 +11,8 @@ A Dagster integration for Google Cloud Dataform that provides asset definitions 
 - **Rich Metadata**: Asset metadata (retrieved at definition time) and materialization metadata (captured at runtime) offer a great degree of detail of remote BQ assets.
 - **SQL Query Tracking**: Preserves and displays SQL queries with proper formatting
 - **GCP Integration**: Seamless integration with Google Cloud Platform using default credentials
+- **Lazy Loading**: Optional lazy loading of assets to specific compilation results to reduce startup time.
+
 
 > [!NOTE]  
 >  Everytime a code location is reloaded, a new compilation result is created for the targeted branch (environment). Therefore if changes are made to the branch, all that is necessary to refresh Dataform Asset/Asset Check metadata in Dagster is to reload the code location.
@@ -98,6 +100,7 @@ resource = DataformRepositoryResource(
     location="us-east4",
     environment="env", # github branch
     sensor_minimum_interval_seconds=30,
+    skip_compilation=True, # enables lazy loading optimization
 )
 
 assets = resource.assets
@@ -218,6 +221,7 @@ The main resource class that provides access to Google Cloud Dataform services. 
 - `location` (str, required): GCP region where Dataform is deployed (e.g., "us-central1", "us-east4")
 - `environment` (str, required): Environment name that matches your Dataform branch (e.g., "dev", "prod", "main")
 - `sensor_minimum_interval_seconds` (int, optional): Minimum polling interval for sensors in seconds (default: 120)
+- `skip_compilation` (bool, optional): If True, assets are loaded lazily and existing compilation results are reused. (default: False)
 
 **Key Methods:** (These methods do not need to be called directly by the user, but for informational purposes here they are)
 - `create_compilation_result()`: Creates a new compilation result in Dataform
@@ -240,6 +244,7 @@ resource = DataformRepositoryResource(
     location="us-central1",
     environment="dev",
     sensor_minimum_interval_seconds=30,
+    skip_compilation=True,
 )
 
 assets = resource.assets

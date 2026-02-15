@@ -18,6 +18,7 @@ class DataformRepositoryResource:
         sensor_minimum_interval_seconds: int = 120,
         client: dataform_v1.DataformClient | None = None,
         asset_fresh_policy_lag_minutes: float = 1440,
+        skip_compilation: bool = False,
     ):
         self.project_id = project_id
         self.location = location
@@ -27,11 +28,169 @@ class DataformRepositoryResource:
         self.logger = dg.get_dagster_logger()
         self.sensor_minimum_interval_seconds = sensor_minimum_interval_seconds
         self.asset_fresh_policy_lag_minutes = asset_fresh_policy_lag_minutes
+        self.skip_compilation = skip_compilation
 
-        self.assets = self.load_dataform_assets(
-            fresh_policy_lag_minutes=self.asset_fresh_policy_lag_minutes
+        if skip_compilation:
+            # Skip Dataform model compilation, use lazy loading
+            self._assets = None
+            self._asset_checks = None
+        else:
+            # Compile Dataform models
+            self.assets = self.load_dataform_assets(
+                fresh_policy_lag_minutes=self.asset_fresh_policy_lag_minutes
+            )
+            self.asset_checks = self.load_dataform_asset_check_specs()
+
+    @property
+    def assets(self) -> list[dg.AssetSpec]:
+        """Lazy-load assets, fetching latest compilation when needed."""
+        if self.skip_compilation and self._assets is None:
+            self._assets = self._fetch_latest_compilation()
+        if self._assets is None:
+            return []
+        return self._assets
+
+    @assets.setter
+    def assets(self, value: list[dg.AssetSpec]):
+        """Setter for assets to support both lazy and immediate loading."""
+        self._assets = value
+
+    @property
+    def asset_checks(self) -> list[dg.AssetChecksDefinition]:
+        """Lazy-load asset checks, fetching latest compilation when needed."""
+        if self.skip_compilation and self._asset_checks is None:
+            compilation_result_name, compilation_actions = (
+                self._fetch_latest_compilation_actions()
+            )
+            self._asset_checks = self._process_asset_checks(compilation_actions)
+        if self._asset_checks is None:
+            return []
+        return self._asset_checks
+
+    @asset_checks.setter
+    def asset_checks(self, value: list[dg.AssetChecksDefinition]):
+        """Setter for asset_checks to support both lazy and immediate loading."""
+        self._asset_checks = value
+
+    def _fetch_latest_compilation(self) -> list[dg.AssetSpec]:
+        """Fetch the most recent compilation instead of creating new one."""
+        compilation_result_name, compilation_actions = (
+            self._fetch_latest_compilation_actions()
         )
-        self.asset_checks = self.load_dataform_asset_check_specs()
+        return self._process_assets(compilation_actions, compilation_result_name)
+
+    def _fetch_latest_compilation_actions(self) -> tuple[str, list[Any]]:
+        """Fetch compilation actions from the latest compilation result. Returns (compilation_result_name, actions)."""
+        compilation_result_name = self.get_latest_compilation_result_name()
+        if not compilation_result_name:
+            self.logger.warning("No existing compilation found, creating new one")
+            # Fallback: create new compilation if none exists
+            self.create_compilation_result(git_commitish=self.environment)
+            compilation_result_name = self.get_latest_compilation_result_name()
+            if not compilation_result_name:
+                raise Exception("Failed to create compilation result")
+
+        self.logger.info(f"Querying compilation result: {compilation_result_name}")
+
+        request = dataform_v1.QueryCompilationResultActionsRequest(
+            name=compilation_result_name,
+        )
+
+        response = self.client.query_compilation_result_actions(request=request)
+        self.logger.info(
+            f"Found {len(response.compilation_result_actions)} compilation result actions"
+        )
+
+        return compilation_result_name, response.compilation_result_actions
+
+    def _process_assets(
+        self, compilation_actions: list[Any], compilation_result_name: str | None = None
+    ) -> list[dg.AssetSpec]:
+        """Process compilation actions into asset specs."""
+        logger = dg.get_dagster_logger()
+        logger.info(
+            f"Processing {len(compilation_actions)} compilation actions for assets"
+        )
+
+        assets = []
+        for asset in compilation_actions:
+            try:
+                spec = dg.AssetSpec(
+                    key=asset.target.name,
+                    kinds={"bigquery"},
+                    metadata={
+                        "Project ID": asset.target.database,
+                        "Dataset": asset.target.schema,
+                        "Asset Name": asset.target.name,
+                        "Docs Link": dg.MetadataValue.url(
+                            f"https://cvsdigital.atlassian.net/wiki/spaces/EDMLABCCM/pages/4616946342/Case+Activities+Entity+Data+Stream#{asset.target.name}"
+                        ),
+                        "Asset SQL Code": dg.MetadataValue.md(
+                            f"```sql\n{asset.relation.select_query}\n```"
+                        ),
+                        "dataform_compilation_result": compilation_result_name,
+                    },
+                    group_name=asset.target.schema,
+                    tags={tag: "" for tag in asset.relation.tags},
+                    deps=[target.name for target in asset.relation.dependency_targets],
+                    legacy_freshness_policy=dg.LegacyFreshnessPolicy(
+                        maximum_lag_minutes=self.asset_fresh_policy_lag_minutes
+                    ),
+                )
+                assets.append(spec)
+                logger.debug(f"Created asset spec for: {asset.target.name}")
+            except Exception as e:
+                logger.error(
+                    f"Failed to create asset spec for {asset.target.name}: {str(e)}"
+                )
+
+        logger.info(f"Successfully created {len(assets)} assets")
+        return assets
+
+    def _process_asset_checks(
+        self, compilation_actions: list[Any]
+    ) -> list[dg.AssetChecksDefinition]:
+        """Process compilation actions into asset check definitions."""
+        logger = dg.get_dagster_logger()
+        logger.info(
+            f"Processing {len(compilation_actions)} compilation actions for asset checks"
+        )
+
+        asset_checks = []
+        for asset in compilation_actions:
+            if asset.assertion:
+                try:
+                    asset_key = asset.assertion.parent_action.name
+
+                    # Convert string to AssetKey
+                    asset_key_obj = dg.AssetKey(asset_key)
+
+                    spec = dg.AssetCheckSpec(
+                        asset=asset_key_obj,  # Use AssetKey object, not string
+                        name=asset.target.name,
+                    )
+
+                    definition = dg.AssetChecksDefinition.create(
+                        keys_by_input_name={
+                            "asset_key": asset_key_obj
+                        },  # Use AssetKey object
+                        node_def=dg.OpDefinition(
+                            name=asset.target.name,
+                            compute_fn=empty_fn,  # We want to simply define the asset check specifications, not a computations for the check. These checks will not be computed on the Dagster side.
+                        ),
+                        check_specs_by_output_name={"spec": spec},
+                        can_subset=False,
+                    )
+
+                    asset_checks.append(definition)
+                    logger.debug(f"Created asset check spec for: {asset.target.name}")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to create asset check spec for {asset.target.name}: {str(e)}"
+                    )
+
+        logger.info(f"Successfully created {len(asset_checks)} asset check specs")
+        return asset_checks
 
     def create_compilation_result(
         self,
