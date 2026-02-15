@@ -83,12 +83,13 @@ class DataformRepositoryResource:
         """Fetch compilation actions from the latest compilation result. Returns (compilation_result_name, actions)."""
         compilation_result_name = self.get_latest_compilation_result_name()
         if not compilation_result_name:
-            self.logger.warning("No existing compilation found, creating new one")
-            # Fallback: create new compilation if none exists
-            self.create_compilation_result(git_commitish=self.environment)
-            compilation_result_name = self.get_latest_compilation_result_name()
-            if not compilation_result_name:
-                raise Exception("Failed to create compilation result")
+            error_msg = (
+                f"No existing compilation result found for branch '{self.environment}'. "
+                "Since 'skip_compilation=True', a valid compilation must already exist in GCP "
+                "(created by CI/CD or an external process)."
+            )
+            self.logger.error(error_msg)
+            raise Exception(error_msg)
 
         self.logger.info(f"Querying compilation result: {compilation_result_name}")
 
@@ -257,6 +258,9 @@ class DataformRepositoryResource:
                 compilation_result.git_commitish == self.environment
                 and not compilation_result.code_compilation_config.table_prefix
             ):
+                self.logger.info(
+                    f"Found existing compilation result for branch '{self.environment}': {compilation_result.name}"
+                )
                 return compilation_result.name
 
         self.logger.error(
