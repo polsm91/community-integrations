@@ -132,7 +132,9 @@ class DataformRepositoryResource:
                         "dataform_compilation_result": compilation_result_name,
                     },
                     group_name=asset.target.schema,
-                    tags={tag: "" for tag in asset.relation.tags},
+                    tags={
+                        tag.replace(":", "_")[:63]: "" for tag in asset.relation.tags
+                    },
                     deps=[target.name for target in asset.relation.dependency_targets],
                     legacy_freshness_policy=dg.LegacyFreshnessPolicy(
                         maximum_lag_minutes=self.asset_fresh_policy_lag_minutes
