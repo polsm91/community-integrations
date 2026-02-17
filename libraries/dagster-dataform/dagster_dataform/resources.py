@@ -1,9 +1,13 @@
+import time
 import dagster as dg
 from typing import Any
 
 from dagster_dataform.utils import get_epoch_time_ago, empty_fn
 
 from google.cloud import dataform_v1
+
+_COMPILATION_CACHE: dict[str, tuple[float, Any]] = {}
+_CACHE_TTL = 60  # seconds
 
 
 class DataformRepositoryResource:
@@ -260,21 +264,39 @@ class DataformRepositoryResource:
             https://cloud.google.com/python/docs/reference/dataform/latest/google.cloud.dataform_v1.types.ListCompilationResultsRequest
         """
 
-        self.logger.info(
-            f"Fetching compilation results for repository: {self.repository_id}"
+        cache_key = (
+            f"{self.project_id}|{self.location}|{self.repository_id}|{self.environment}"
         )
+        current_time = time.time()
 
-        request = dataform_v1.ListCompilationResultsRequest(
-            parent=f"projects/{self.project_id}/locations/{self.location}/repositories/{self.repository_id}",
-            page_size=1000,
-            order_by="create_time desc",
-        )
+        cached_entry = _COMPILATION_CACHE.get(cache_key)
+        if cached_entry and (current_time - cached_entry[0] < _CACHE_TTL):
+            self.logger.debug(f"Using cached compilation results for {cache_key}")
+            compilation_results = cached_entry[1]
+        else:
+            self.logger.info(
+                f"Fetching compilation results for repository: {self.repository_id} (Cache miss)"
+            )
 
-        response = self.client.list_compilation_results(request=request)
+            request = dataform_v1.ListCompilationResultsRequest(
+                parent=f"projects/{self.project_id}/locations/{self.location}/repositories/{self.repository_id}",
+                page_size=1000,
+                order_by="create_time desc",
+                filter=f'git_commitish="{self.environment}"',
+            )
 
-        self.logger.info(
-            f"Found {len(response.compilation_results)} compilation results"
-        )
+            try:
+                response = self.client.list_compilation_results(request=request)
+                compilation_results = list(response.compilation_results)
+                _COMPILATION_CACHE[cache_key] = (current_time, compilation_results)
+                self.logger.info(
+                    f"Found {len(compilation_results)} compilation results (Cached)"
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to list compilation results: {e}")
+                # If API fails but we have stale cache, potentially return stale?
+                # For now, just raise or let it fail.
+                raise e
 
         filter_desc_parts = [f"branch='{self.environment}'"]
         if default_database:
@@ -283,7 +305,7 @@ class DataformRepositoryResource:
             filter_desc_parts.append(f"vars={vars}")
         filter_desc = ", ".join(filter_desc_parts)
 
-        for compilation_result in response.compilation_results:
+        for compilation_result in compilation_results:
             config = compilation_result.code_compilation_config
 
             # Must match git branch and have no table_prefix
@@ -308,9 +330,7 @@ class DataformRepositoryResource:
             )
             return compilation_result.name
 
-        self.logger.error(
-            f"No compilation result found matching [{filter_desc}]"
-        )
+        self.logger.error(f"No compilation result found matching [{filter_desc}]")
         return None
 
     def query_compilation_result(self) -> list[Any]:
@@ -558,3 +578,91 @@ class DataformRepositoryResource:
 
         logger.error(f"Successfully created {len(asset_checks)} asset check specs")
         return asset_checks
+
+    def compile_and_execute_single_target(
+        self,
+        target_name: str,
+        target_project: str,
+        target_dataset: str,
+        compilation_overrides: dict[str, Any] | None = None,
+    ) -> str:
+        """Executes a Dataform workflow for a single target, handling compilation and polling.
+
+        Args:
+            target_name: The name of the table/view to run.
+            target_project: The GCP project ID where the target resides.
+            target_dataset: The BigQuery dataset where the target resides.
+            compilation_overrides: Configuration for the compilation result (default_database, vars, etc.).
+                                   Must contain 'default_database' to ensure correct compilation matching.
+
+        Returns:
+            The workflow invocation name upon success.
+
+        Raises:
+            Exception: If execution fails or is cancelled.
+        """
+        self.logger.info(
+            f"Starting Dataform execution for {target_name} with overrides: {compilation_overrides}"
+        )
+
+        overrides = compilation_overrides or {}
+        default_database = overrides.get("default_database")
+        vars_dict = overrides.get("vars")
+
+        try:
+            # 1. Search for existing compilation result with matching database and vars
+            compilation_result_name = self.get_latest_compilation_result_name(
+                default_database=default_database,
+                vars=vars_dict,
+            )
+
+            if compilation_result_name:
+                self.logger.info(
+                    f"Reusing existing compilation for database={default_database}: "
+                    f"{compilation_result_name}"
+                )
+            else:
+                # No matching compilation found — create a new one
+                self.logger.info(
+                    f"No matching compilation found for database={default_database}. "
+                    f"Creating new compilation."
+                )
+                compilation_result = self.create_compilation_result(
+                    git_commitish=self.environment, **overrides
+                )
+                compilation_result_name = compilation_result.name
+
+            # 2. Trigger execution for the specific target
+            # Execute only the specific target - Dataform handles dependencies internally
+            target_spec = {
+                "database": target_project,
+                "schema": target_dataset,
+                "name": target_name,
+            }
+
+            invocation = self.create_workflow_invocation(
+                compilation_result_name=compilation_result_name,
+                included_targets=[target_spec],
+                transitive_dependencies_included=False,
+                fully_refresh_incremental_tables_enabled=False,
+            )
+
+            # Poll for completion
+            while True:
+                result = self.get_workflow_invocation_details(invocation.name)
+                if result.state == dataform_v1.WorkflowInvocation.State.SUCCEEDED:
+                    self.logger.info(f"Dataform execution succeeded for {target_name}")
+                    return invocation.name
+                elif result.state in (
+                    dataform_v1.WorkflowInvocation.State.FAILED,
+                    dataform_v1.WorkflowInvocation.State.CANCELLED,
+                ):
+                    error_msg = f"Dataform execution failed: {result.state}"
+                    self.logger.error(error_msg)
+                    raise Exception(error_msg)
+
+                time.sleep(5)  # Wait 5 seconds before polling again
+
+        except Exception as e:
+            self.logger.error(f"Failed to trigger Dataform execution: {e}")
+            raise e

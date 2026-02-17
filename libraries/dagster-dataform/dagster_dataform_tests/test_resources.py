@@ -613,3 +613,65 @@ def test_dataform_repository_resource_lazy_load_asset_checks(mock_dataform_clien
     assert len(asset_checks) == 1
     assert isinstance(asset_checks[0], AssetChecksDefinition)
     assert asset_checks[0].check_specs_by_output_name["spec"].name == "assertion_1"
+
+
+@pytest.mark.parametrize(
+    "mock_dataform_client",
+    [
+        {
+            "git_commitish": "dev",
+            "default_database": "test-database",
+            "default_schema": "test-schema",
+            "default_location": "us-central1",
+            "assertion_schema": "test-assertion-schema",
+        }
+    ],
+    indirect=True,
+)
+def test_dataform_repository_resource_compile_and_execute_single_target(
+    mock_dataform_client,
+):
+    resource = DataformRepositoryResource(
+        project_id="test-project",
+        repository_id="test-repo",
+        location="us-central1",
+        environment="dev",
+        client=mock_dataform_client,
+    )
+
+    invocation_name = resource.compile_and_execute_single_target(
+        target_name="test_target",
+        target_project="test-project",
+        target_dataset="test_dataset",
+        compilation_overrides={"default_database": "test-database"},
+    )
+
+    assert invocation_name == "test-workflow-invocation"
+
+    # Verify compilation search
+    mock_dataform_client.list_compilation_results.assert_called()
+
+    # Verify workflow invocation creation with correct target
+    expected_request = dataform_v1.CreateWorkflowInvocationRequest(
+        parent="projects/test-project/locations/us-central1/repositories/test-repo",
+        workflow_invocation=dataform_v1.WorkflowInvocation(
+            compilation_result="test-compilation-result",
+            invocation_config=dataform_v1.InvocationConfig(
+                included_targets=[
+                    dataform_v1.Target(
+                        database="test-project",
+                        schema="test_dataset",
+                        name="test_target",
+                    )
+                ],
+                transitive_dependencies_included=False,
+                fully_refresh_incremental_tables_enabled=False,
+            ),
+        ),
+    )
+    mock_dataform_client.create_workflow_invocation.assert_called_with(
+        request=expected_request
+    )
+
+    # Verify polling
+    mock_dataform_client.get_workflow_invocation.assert_called()
