@@ -142,6 +142,72 @@ def test_dataform_repository_resource_get_latest_compilation_result_name_correct
     [
         {
             "git_commitish": "dev",
+            "default_database": "production-project",
+            "default_schema": "test-schema",
+            "default_location": "us-central1",
+            "assertion_schema": "test-assertion-schema",
+        }
+    ],
+    indirect=True,
+)
+def test_dataform_repository_resource_get_latest_compilation_result_name_wrong_database(
+    mock_dataform_client,
+):
+    """A compilation for a different default_database should not be returned when filtering by database."""
+    resource = DataformRepositoryResource(
+        project_id="test-project",
+        repository_id="test-repo",
+        location="us-central1",
+        environment="dev",
+        client=mock_dataform_client,
+    )
+
+    # The mock has default_database="production-project", but we're looking for "staging-project"
+    compilation_result = resource.get_latest_compilation_result_name(
+        default_database="staging-project"
+    )
+
+    assert compilation_result is None
+
+
+@pytest.mark.parametrize(
+    "mock_dataform_client",
+    [
+        {
+            "git_commitish": "dev",
+            "default_database": "staging-project",
+            "default_schema": "test-schema",
+            "default_location": "us-central1",
+            "assertion_schema": "test-assertion-schema",
+        }
+    ],
+    indirect=True,
+)
+def test_dataform_repository_resource_get_latest_compilation_result_name_matching_database(
+    mock_dataform_client,
+):
+    """A compilation for the correct default_database should be returned."""
+    resource = DataformRepositoryResource(
+        project_id="test-project",
+        repository_id="test-repo",
+        location="us-central1",
+        environment="dev",
+        client=mock_dataform_client,
+    )
+
+    compilation_result = resource.get_latest_compilation_result_name(
+        default_database="staging-project"
+    )
+
+    assert compilation_result is not None
+    assert compilation_result == "test-compilation-result"
+
+
+@pytest.mark.parametrize(
+    "mock_dataform_client",
+    [
+        {
+            "git_commitish": "dev",
             "default_database": "test-database",
             "default_schema": "test-schema",
             "default_location": "us-central1",

@@ -234,9 +234,30 @@ class DataformRepositoryResource:
 
         return response
 
-    def get_latest_compilation_result_name(self) -> str | None:
-        """Get the latest compilation result for the repository.
-        https://cloud.google.com/python/docs/reference/dataform/latest/google.cloud.dataform_v1.types.ListCompilationResultsRequest
+    def get_latest_compilation_result_name(
+        self,
+        default_database: str | None = None,
+        vars: dict[str, str] | None = None,
+    ) -> str | None:
+        """Get the latest compilation result for the repository that matches the given filters.
+
+        Searches recent compilation results ordered by creation time (newest first) and
+        returns the first one matching all specified criteria.
+
+        Args:
+            default_database: If provided, only match compilations whose
+                ``code_compilation_config.default_database`` equals this value.
+                This prevents picking up a compilation compiled for a different
+                GCP project (e.g. production vs staging).
+            vars: If provided, only match compilations whose
+                ``code_compilation_config.vars`` match these values exactly.
+                Useful for environment-specific compilations (e.g. ``{"env": "staging"}``).
+
+        Returns:
+            The compilation result resource name, or ``None`` if no match is found.
+
+        See Also:
+            https://cloud.google.com/python/docs/reference/dataform/latest/google.cloud.dataform_v1.types.ListCompilationResultsRequest
         """
 
         self.logger.info(
@@ -255,18 +276,40 @@ class DataformRepositoryResource:
             f"Found {len(response.compilation_results)} compilation results"
         )
 
+        filter_desc_parts = [f"branch='{self.environment}'"]
+        if default_database:
+            filter_desc_parts.append(f"default_database='{default_database}'")
+        if vars:
+            filter_desc_parts.append(f"vars={vars}")
+        filter_desc = ", ".join(filter_desc_parts)
+
         for compilation_result in response.compilation_results:
-            if (
-                compilation_result.git_commitish == self.environment
-                and not compilation_result.code_compilation_config.table_prefix
-            ):
-                self.logger.info(
-                    f"Found existing compilation result for branch '{self.environment}': {compilation_result.name}"
-                )
-                return compilation_result.name
+            config = compilation_result.code_compilation_config
+
+            # Must match git branch and have no table_prefix
+            if compilation_result.git_commitish != self.environment:
+                continue
+            if config.table_prefix:
+                continue
+
+            # Match default_database if specified
+            if default_database and config.default_database != default_database:
+                continue
+
+            # Match vars if specified (all key-value pairs must match)
+            if vars:
+                config_vars = dict(config.vars) if config.vars else {}
+                if not all(config_vars.get(k) == v for k, v in vars.items()):
+                    continue
+
+            self.logger.info(
+                f"Found existing compilation result matching [{filter_desc}]: "
+                f"{compilation_result.name}"
+            )
+            return compilation_result.name
 
         self.logger.error(
-            f"No compilation result for {self.environment} branch in the last 10 compilation results"
+            f"No compilation result found matching [{filter_desc}]"
         )
         return None
 
